@@ -1,7 +1,7 @@
 # OvenController — Adaptive PID Reflow Oven (ESP-IDF)
 
 ESP32-based reflow oven controller for T962A conversions. Ported from Arduino PlatformIO to ESP-IDF v5.x native SDK.
-**Beware, Not tested on hardware Yet**
+**Beware, Not tested on hardware yet**
 
 ## Hardware
 
