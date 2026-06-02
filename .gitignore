@@ -1,0 +1,30 @@
+# ESP-IDF build artifacts
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Firmware binaries
+*.bin
+*.elf
+*.map
+*.hex
+
+# ESP-IDF generated
+managed_components/
