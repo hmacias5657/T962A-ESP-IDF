@@ -6,7 +6,7 @@ ESP32-based reflow oven controller for T962A conversions. Ported from Arduino Pl
 
 - **MCU**: ESP32 WROOM (dual-core, 240MHz)
 - **Display**: 128x64 GLCD KS0108 (8-bit parallel) via U8G2
-- **ADC**: ADS1015 12-bit I2C (2x K-type thermocouples using AD8495 as amplifiers
+- **ADC**: ADS1015 12-bit I2C (2x K-type thermocouples using AD8495 as amplifiers with cold junction compensation)
 - **Heater**: Zero-cross SSR with Bresenham PID (256 half-cycles)
 - **Cooling**: SSR + PWM system fan (25kHz MOSFET)
 - **Input**: T962A 5-key membrane (F1-UP, F2-DOWN, F3-LEFT, F4-RIGHT, S-START)
