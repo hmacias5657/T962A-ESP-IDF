@@ -1,5 +1,7 @@
 # T962A-ESP-IDF — Adaptive PID Reflow Oven (ESP-IDF)
 
+> **⚠️ Beware, not tested with hardware yet.** This firmware compiles and the UI logic has been validated, but it has not been run on a real T962A oven.
+
 ESP32-based reflow oven controller for T962A conversions. Ported from Arduino PlatformIO to ESP-IDF v5.x native SDK.
 
 > **Repo**: [github.com/hmacias5657/T962A-ESP-IDF](https://github.com/hmacias5657/T962A-ESP-IDF)  
@@ -21,7 +23,7 @@ ESP32-based reflow oven controller for T962A conversions. Ported from Arduino Pl
 - Auto-detected line frequency at startup (50Hz or 60Hz) — eliminates hardcoded regional assumption
 - Bresenham PID power distribution with feedforward control — PID + feedforward from profile ramp rate, capped at 80%
 - 5 independent PID gain sets per recipe (both heater and cooling), with stage-based scheduling (PREHEAT/SOAK/REFLOW/COOLDOWN)
-- Per-profile adaptive fine-tuning — gains adjusted ±5% after each zone based on overshoot, steady error, oscillation, settling time. Sequence-numbered precedence resolves calibration test vs per-profile tuning
+- **Per-profile adaptive fine-tuning (`AITuner`)**: After each zone completes, `ZoneMetrics` (overshoot, steady error, oscillation amplitude, settling time) are evaluated and PID gains adjusted conservatively (±5%) per-zone per-recipe. Gains converge over 3–5 runs. Sequence-numbered precedence (`calibSeq` / `tuneSeq`) resolves calibration test vs per-profile tuning — the most recent action wins
 - Ziegler-Nichols base gains computed from deadtime + per-zone heating rates during calibration test
 - EMA temperature filtering (alpha=0.15) on both thermocouples with filtered derivative in PID
 - ADS1015 12-bit external ADC with ±10°C per-sensor calibration (0.5°C steps)
