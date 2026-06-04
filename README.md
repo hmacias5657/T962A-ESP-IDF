@@ -1,7 +1,7 @@
 # T962A-ESP-IDF — Adaptive PID Reflow Oven (ESP-IDF)
 
 ESP32-based reflow oven controller for T962A conversions. Ported from Arduino PlatformIO to ESP-IDF v5.x native SDK.
-
+**Beware, this code has not been tested on hardware yet**
 > **Repo**: [github.com/hmacias5657/T962A-ESP-IDF](https://github.com/hmacias5657/T962A-ESP-IDF)  
 > **Project root**: `T962A_OvenController/` (run `idf.py` commands from this directory)
 
