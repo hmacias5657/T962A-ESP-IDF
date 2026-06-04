@@ -1,56 +1,118 @@
 #include "AITuner.h"
+#include "Config.h"
 #include <cmath>
 
 AITuner::AITuner()
-    : _spatialDamping(0.85f)
-    , _learningRate(0.01f)
-    , _lastError(0.0f)
-    , _heatDeadTimeSec(0.0f)
+    : _heatDeadTimeSec(0.0f)
     , _coolDeadTimeSec(0.0f) {}
 
-int AITuner::selectZone(float setpoint) const {
-    if (setpoint < 100.0f) return 0;
-    if (setpoint < 150.0f) return 1;
-    if (setpoint < 200.0f) return 2;
-    if (setpoint < 250.0f) return 3;
-    return 4;
+int AITuner::selectZone(ReflowStage stage) const {
+    switch (stage) {
+        case STAGE_PREHEAT:  return 0;
+        case STAGE_SOAK:     return 1;
+        case STAGE_REFLOW:   return 2;
+        case STAGE_COOLDOWN: return 3;
+        default:             return 4;
+    }
 }
 
 PidGains AITuner::scheduleHeaterGains(const PidGains* zoneGains, int zone) const {
-    PidGains g = zoneGains[zone];
-    g.kp *= _spatialDamping;
-    g.ki *= _spatialDamping;
-    g.kd *= _spatialDamping;
-    return g;
+    return zoneGains[zone];
 }
 
 PidGains AITuner::scheduleCoolingGains(const PidGains* zoneGains, int zone) const {
-    PidGains g = zoneGains[zone];
-    g.kp *= (1.0f - _spatialDamping);
-    g.ki *= (1.0f - _spatialDamping);
-    g.kd *= (1.0f - _spatialDamping);
-    return g;
-}
-
-void AITuner::learn(float actualTemp, float setpoint, float output, float dt) {
-    float error = setpoint - actualTemp;
-    float errorDelta = (error - _lastError) / (dt + 0.001f);
-    _lastError = error;
-    _spatialDamping += _learningRate * error * errorDelta * dt;
-    _spatialDamping = fmaxf(0.5f, fminf(1.0f, _spatialDamping));
+    return zoneGains[zone];
 }
 
 void AITuner::setDeadTime(float heatDeadTimeSec, float coolDeadTimeSec) {
     _heatDeadTimeSec = heatDeadTimeSec;
     _coolDeadTimeSec = coolDeadTimeSec;
-    float dtFactor = 1.0f / (1.0f + heatDeadTimeSec + coolDeadTimeSec);
-    _learningRate = 0.01f * dtFactor;
 }
 
 float AITuner::getHeatDeadTime() const { return _heatDeadTimeSec; }
 float AITuner::getCoolDeadTime() const { return _coolDeadTimeSec; }
 
-void AITuner::reset() {
-    _spatialDamping = 0.85f;
-    _lastError = 0.0f;
+void AITuner::reset() {}
+
+void AITuner::resetMetrics(ZoneMetrics& m, float setpoint, uint32_t elapsedSec) const {
+    m.peakTemp = -999.0f;
+    m.setpoint = setpoint;
+    m.steadyError = 0.0f;
+    m.oscillationAmp = 0.0f;
+    m.riseTime90 = 0.0f;
+    m.settlingTime = 0.0f;
+    m.maxRate = 0.0f;
+    m.sampleCount = 0;
+    m.errorSum = 0.0f;
+    m.errorAbsSum = 0.0f;
+    m.tempMin = 999.0f;
+    m.tempMax = -999.0f;
+    m.lastTemp = -999.0f;
+    m.prevSlope = 0.0f;
+    m.zeroCrossCount = 0;
+    m.entryTimeSec = elapsedSec;
+    m.settled = false;
+}
+
+void AITuner::updateMetrics(ZoneMetrics& m, float temp, float setpoint, float dt) const {
+    m.sampleCount++;
+    m.errorSum += setpoint - temp;
+    m.errorAbsSum += fabsf(setpoint - temp);
+
+    if (temp > m.tempMax) m.tempMax = temp;
+    if (temp < m.tempMin) m.tempMin = temp;
+
+    if (temp > m.peakTemp) {
+        m.peakTemp = temp;
+        if (m.peakTemp >= setpoint * FINE_TUNE_RISE_PCT && m.riseTime90 == 0.0f) {
+            m.riseTime90 = m.sampleCount * dt;
+        }
+    }
+
+    if (!m.settled && fabsf(temp - setpoint) <= FINE_TUNE_SETTLE_BAND_C) {
+        m.settlingTime = m.sampleCount * dt;
+        m.settled = true;
+    }
+
+    if (m.lastTemp != -999.0f) {
+        float slope = (temp - m.lastTemp) / dt;
+        float absSlope = fabsf(slope);
+        if (absSlope > m.maxRate) m.maxRate = absSlope;
+
+        if (m.prevSlope != 0.0f && slope * m.prevSlope < 0.0f) {
+            m.zeroCrossCount++;
+        }
+        m.prevSlope = slope;
+    }
+    m.lastTemp = temp;
+}
+
+void AITuner::fineTuneZone(const ZoneMetrics& m, PidGains& g) const {
+    float overshoot = m.peakTemp - m.setpoint;
+    float steadyErr = (m.sampleCount > 0) ? m.errorAbsSum / m.sampleCount : 0.0f;
+
+    float range = m.tempMax - m.tempMin;
+    float oscAmp = (m.zeroCrossCount > 2) ? range : 0.0f;
+
+    if (overshoot > FINE_TUNE_OVERSHOOT_C) {
+        g.kp *= (1.0f - FINE_TUNE_ADJUST_RATE);
+        g.kd *= (1.0f + FINE_TUNE_ADJUST_RATE);
+    }
+
+    if (steadyErr > FINE_TUNE_STEADY_ERROR_C) {
+        g.ki *= (1.0f + FINE_TUNE_ADJUST_RATE);
+    }
+
+    if (oscAmp > FINE_TUNE_OSCILLATION_C) {
+        g.kp *= (1.0f - FINE_TUNE_ADJUST_RATE);
+        g.kd *= (1.0f + FINE_TUNE_DAMP_RATE);
+    }
+
+    if (!m.settled && m.sampleCount > 10) {
+        g.ki *= (1.0f - FINE_TUNE_ADJUST_RATE);
+    }
+
+    g.kp = fmaxf(FINE_TUNE_KP_MIN, fminf(FINE_TUNE_KP_MAX, g.kp));
+    g.ki = fmaxf(FINE_TUNE_KI_MIN, fminf(FINE_TUNE_KI_MAX, g.ki));
+    g.kd = fmaxf(FINE_TUNE_KD_MIN, fminf(FINE_TUNE_KD_MAX, g.kd));
 }

@@ -270,7 +270,16 @@ void DisplayRenderer::renderRecipeEdit(const ReflowRecipe& recipe, int field) {
         snprintf(_buf, sizeof(_buf), "%sReflow: %ds", field == 5 ? ">" : " ", recipe.reflowTimeSec);
         u8g2_DrawStr(&_display, 0, 48, _buf);
 
-        snprintf(_buf, sizeof(_buf), "%sHold:   %ds", field == 6 ? ">" : " ", recipe.holdTimeSec);
+        if (field == 6) {
+            snprintf(_buf, sizeof(_buf), ">Hold:%ds Tune:%s", recipe.holdTimeSec,
+                     recipe.fineTuneEnabled ? "ON" : "OFF");
+        } else if (field == 7) {
+            snprintf(_buf, sizeof(_buf), " Hold:%ds >Tune:%s", recipe.holdTimeSec,
+                     recipe.fineTuneEnabled ? "ON" : "OFF");
+        } else {
+            snprintf(_buf, sizeof(_buf), " Hold:%ds Tune:%s", recipe.holdTimeSec,
+                     recipe.fineTuneEnabled ? "ON" : "OFF");
+        }
         u8g2_DrawStr(&_display, 0, 56, _buf);
     } while (u8g2_NextPage(&_display));
 }

@@ -7,8 +7,8 @@ Adaptive PID Reflow Oven Controller for T962A oven conversion. Ported from Ardui
 ## Architecture
 
 ### Dual-Core FreeRTOS
-- **Core 0 (controlTask)**: Reflow control loop at ~2.13–2.56s period (auto-detected from line frequency), priority 3, stack 4096
-- **Core 1 (uiTask)**: UI refresh at ~30ms period, priority 1, stack 8192. Full menu navigation state machine: main menu (6 items), recipe list/edit, settings, bake setup, calibration (submenu with 3 items: TC offset, profile cal test, view cal info), running display with plot toggle, e-stop acknowledge
+- **Core 0 (controlTask)**: Reflow control loop at ~2.13–2.56s period (auto-detected from line frequency), priority 3, stack 4096. Per-cycle: read sensors (EMA-filtered) → gain scheduling via `AITuner::selectZone(ReflowStage)` → compute feedforward from profile ramp rate → PID compute with filtered derivative + feedforward injection → zone transition detection (fine-tune previous zone, reset integral, reset ZoneMetrics) → Ki suppression near peak → heater off during cooldown → telemetry push to queue
+- **Core 1 (uiTask)**: UI refresh at ~30ms period, priority 1, stack 8192. Full menu navigation state machine: main menu (6 items), recipe list/edit (8 fields incl. fine-tune toggle), settings, bake setup, calibration (submenu with 3 items: TC offset, profile cal test, view cal info), running display with plot toggle, e-stop acknowledge
 - Inter-task communication via `xQueueOverwrite` (1-slot queue) for telemetry
 - I2C bus access serialized via `SemaphoreHandle_t` mutex
 
@@ -16,14 +16,14 @@ Adaptive PID Reflow Oven Controller for T962A oven conversion. Ported from Ardui
 
 | Module | Files | Responsibility |
 |--------|-------|----------------|
-| Config | `Config.h` | Pin mappings, constants, limits, firmware version |
-| SharedData | `SharedData.h` | Structs/enums: ReflowRecipe, PidGains, TemperatureData, ThermalTelemetry, SystemSettings |
-| BresenhamPID | `BresenhamPID.h/.cpp` | ZC ISR (IRAM_ATTR) with frequency auto-measure (20-sample average), dual Bresenham channels (heater + cooling fan SSR), PID compute. Exposes `getHalfCycleUs()`, `getLineFrequency()`, `getPidIntervalMs()`, `measureLineFrequency()` |
-| TemperatureReader | `TemperatureReader.h/.cpp` | ADS1015 I2C reads, calibration offsets, fault detection |
+| Config | `Config.h` | Pin mappings, constants, limits, firmware version, fine-tuning thresholds, feedforward cap |
+| SharedData | `SharedData.h` | Structs/enums: ReflowRecipe, PidGains, TemperatureData, ThermalTelemetry, SystemSettings, ZoneMetrics |
+| BresenhamPID | `BresenhamPID.h/.cpp` | ZC ISR (IRAM_ATTR) with frequency auto-measure (20-sample average), dual Bresenham channels (heater + cooling fan SSR), PID compute with filtered derivative + feedforward injection. Exposes `getHalfCycleUs()`, `getLineFrequency()`, `getPidIntervalMs()`, `measureLineFrequency()`, `setFeedforward()`, `resetIntegral()` |
+| TemperatureReader | `TemperatureReader.h/.cpp` | ADS1015 I2C reads, EMA filter (alpha=0.15), calibration offsets, fault detection on raw values. Exposes `resetFilters()` |
 | ADS1015_Driver | `ADS1015_Driver.h/.cpp` | Direct I2C register access (replaces Adafruit library) |
-| ProfileEngine | `ProfileEngine.h/.cpp` | 5-stage linear interpolation, bake mode setpoint generation |
-| AITuner | `AITuner.h/.cpp` | Spatial damping + learning heuristic for gain scheduling |
-| DisplayRenderer | `DisplayRenderer.h/.cpp` | KS0108 via U8G2 (full frame buffer), full menu system: main menu, recipe list/edit, running display with progress bars + mini graph, live plot, settings, bake setup, calibration submenu, calibration test screens (running with live temp graph + results), calibration info viewer (3-page: PID gains / cal data / recipe temps), e-stop. Built-in °C/°F unit conversion helpers (`toDisplayUnit`, `toDisplayRate`, `unitSuffix`, `rateSuffix`). Splash shows firmware version + detected line frequency |
+| ProfileEngine | `ProfileEngine.h/.cpp` | 5-stage linear interpolation, bake mode setpoint generation, ramp rate query for feedforward (`getRampRate()`) |
+| AITuner | `AITuner.h/.cpp` | Stage-based gain scheduling (`selectZone(ReflowStage)`), ZoneMetrics accumulator (`resetMetrics`, `updateMetrics`), per-zone fine-tuning (`fineTuneZone`) with conservative ±5% adjustments based on overshoot, steady error, oscillation, settling time |
+| DisplayRenderer | `DisplayRenderer.h/.cpp` | KS0108 via U8G2 (full frame buffer), full menu system: main menu, recipe list/edit (8 fields including fine-tune toggle), running display with progress bars + mini graph, live plot, settings, bake setup, calibration submenu, calibration test screens (running with live temp graph + results), calibration info viewer (3-page: PID gains / cal data / recipe temps), e-stop. Built-in °C/°F unit conversion helpers (`toDisplayUnit`, `toDisplayRate`, `unitSuffix`, `rateSuffix`). Splash shows firmware version + detected line frequency |
 | ButtonDebouncer | `ButtonDebouncer.h/.cpp` | 50ms non-blocking debounce, 5 T962A keys + E-STOP |
 | Buzzer | `Buzzer.h/.cpp` | 6 buzzer pattern generator |
 | Main | `main.cpp` | `app_main()` entry, NVS init, I2C bus init, ZC frequency measurement + NVS persist, splash screen, task creation. Navigation state (s_menuCursor, s_recipeCursor, s_recipeField, s_showPlot, etc.) drives uiTask menu machine |
@@ -68,23 +68,17 @@ Adaptive PID Reflow Oven Controller for T962A oven conversion. Ported from Ardui
 ```bash
 idf.py set-target esp32
 idf.py menuconfig    # CPU 240MHz, dual-core, custom partitions
-idf.py build
+idf.py build          # rename_firmware.py runs automatically via CMake POST_BUILD
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
 ## Firmware Versioning
 
-A post-build script `rename_firmware.py` automatically versions the output binary:
-
-```bash
-python3 rename_firmware.py
-```
+The post-build script `rename_firmware.py` runs **automatically** via a CMake `POST_BUILD` command after every `idf.py build`. No manual invocation needed.
 
 Reads `FIRMWARE_VERSION_*` defines from `Config.h` and creates:
 - `OvenController_v{major}.{minor}.{patch}_{timestamp}.bin` — timestamped archive
 - `OvenController_v{major}.{minor}.{patch}.bin` — latest version copy
-
-Run after `idf.py build` or integrate as a post-build step in your IDE/task runner.
 
 ## NVS Keys
 
@@ -97,8 +91,11 @@ Additional ESP-IDF keys:
 `z%d_crate` — per-zone max cooling rate (int32 ×1000)
 `heatDTms` — heat dead time in milliseconds (uint32)
 `coolDTms` — cool dead time in milliseconds (uint32)
+`calibSeq` — global calibration sequence number (int32), incremented each calibration test
+`r%d_tuneEn` — per-recipe fine-tune enable (u8, 0/1)
+`r%d_tuneSeq` — per-recipe tune sequence number (int32), set to calibSeq when fine-tuned
 
-Data stored as: strings (names), int32 scaled by 100 (temps) or 1000 (gains), u8 (booleans).
+Data stored as: strings (names), int32 scaled by 100 (temps) or 1000 (gains), u8 (booleans), uint32 (sequences).
 
 ## Safety Features
 

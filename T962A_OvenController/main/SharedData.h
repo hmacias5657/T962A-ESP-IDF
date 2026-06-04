@@ -48,6 +48,26 @@ struct PidGains {
     float kd;
 };
 
+struct ZoneMetrics {
+    float peakTemp;
+    float setpoint;
+    float steadyError;
+    float oscillationAmp;
+    float riseTime90;
+    float settlingTime;
+    float maxRate;
+    int sampleCount;
+    float errorSum;
+    float errorAbsSum;
+    float tempMin;
+    float tempMax;
+    float lastTemp;
+    float prevSlope;
+    int zeroCrossCount;
+    uint32_t entryTimeSec;
+    bool settled;
+};
+
 struct ReflowRecipe {
     char name[MAX_RECIPE_NAME_LEN];
     float preheatTemp;
@@ -59,6 +79,8 @@ struct ReflowRecipe {
     uint16_t holdTimeSec;
     PidGains heaterGains[PID_ZONES];
     PidGains coolingGains[PID_ZONES];
+    bool fineTuneEnabled;
+    uint32_t tuneSeq;
 };
 
 struct TemperatureData {

@@ -1,6 +1,9 @@
 #include "ProfileEngine.h"
 #include <cmath>
 
+static const float AMBIENT_TEMP = 25.0f;
+static const uint32_t COOLDOWN_DURATION_SEC = 60;
+
 ProfileEngine::ProfileEngine() : _loaded(false) {
     _recipe = ReflowRecipe();
 }
@@ -14,23 +17,48 @@ float ProfileEngine::getSetpoint(uint32_t elapsedSec) const {
     if (!_loaded) return 0.0f;
 
     uint32_t t = elapsedSec;
-    float ambient = 25.0f;
 
     uint32_t tRampEnd = _recipe.rampTimeSec;
     uint32_t tSoakEnd = tRampEnd + _recipe.soakTimeSec;
     uint32_t tReflowEnd = tSoakEnd + _recipe.reflowTimeSec;
     uint32_t tHoldEnd = tReflowEnd + _recipe.holdTimeSec;
+    uint32_t tCoolEnd = tHoldEnd + COOLDOWN_DURATION_SEC;
 
     if (t <= tRampEnd) {
-        return interpolate((float)t, 0, (float)tRampEnd, ambient, _recipe.soakTemp);
+        return interpolate((float)t, 0, (float)tRampEnd, AMBIENT_TEMP, _recipe.soakTemp);
     } else if (t <= tSoakEnd) {
         return _recipe.soakTemp;
     } else if (t <= tReflowEnd) {
         return interpolate((float)t, (float)tSoakEnd, (float)tReflowEnd, _recipe.soakTemp, _recipe.peakTemp);
     } else if (t <= tHoldEnd) {
         return _recipe.peakTemp;
+    } else if (t <= tCoolEnd) {
+        return interpolate((float)t, (float)tHoldEnd, (float)tCoolEnd, _recipe.peakTemp, AMBIENT_TEMP);
     } else {
-        return interpolate((float)t, (float)tHoldEnd, (float)(tHoldEnd + 60), _recipe.peakTemp, ambient);
+        return AMBIENT_TEMP;
+    }
+}
+
+float ProfileEngine::getRampRate(uint32_t elapsedSec) const {
+    if (!_loaded) return 0.0f;
+
+    ReflowStage stage = getStage(elapsedSec);
+
+    switch (stage) {
+        case STAGE_PREHEAT: {
+            if (_recipe.rampTimeSec == 0) return 0.0f;
+            return (_recipe.soakTemp - AMBIENT_TEMP) / _recipe.rampTimeSec;
+        }
+        case STAGE_SOAK:
+            return 0.0f;
+        case STAGE_REFLOW: {
+            if (_recipe.reflowTimeSec == 0) return 0.0f;
+            return (_recipe.peakTemp - _recipe.soakTemp) / _recipe.reflowTimeSec;
+        }
+        case STAGE_COOLDOWN:
+            return -1.0f;
+        default:
+            return 0.0f;
     }
 }
 
@@ -44,14 +72,14 @@ ReflowStage ProfileEngine::getStage(uint32_t elapsedSec) const {
     t -= _recipe.soakTimeSec;
     if (t < _recipe.reflowTimeSec) return STAGE_REFLOW;
     t -= _recipe.reflowTimeSec;
-    if (t < _recipe.holdTimeSec + 60) return STAGE_COOLDOWN;
+    if (t < _recipe.holdTimeSec + COOLDOWN_DURATION_SEC) return STAGE_COOLDOWN;
     return STAGE_COMPLETE;
 }
 
 uint32_t ProfileEngine::getTotalDuration() const {
     if (!_loaded) return 0;
     return _recipe.rampTimeSec + _recipe.soakTimeSec +
-           _recipe.reflowTimeSec + _recipe.holdTimeSec + 60;
+           _recipe.reflowTimeSec + _recipe.holdTimeSec + COOLDOWN_DURATION_SEC;
 }
 
 const ReflowRecipe* ProfileEngine::getRecipe() const {

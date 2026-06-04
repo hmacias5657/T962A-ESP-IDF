@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.11.0] — 2026-06-03
+
+### Added
+- **Feedforward control**: Heater output now combines PID + feedforward from profile ramp rate. Feedforward = `(dTarget/dt) / heatingRate[zone] * maxOutput`, capped at 80%. Allows the PID to correct only residual error rather than overcoming the full thermal load — the biggest improvement beyond the original Gemini design.
+- **EMA temperature filtering**: Single-pole exponential moving average (`alpha=0.15`) applied to both thermocouple readings after raw-to-Celsius conversion. Fault detection still uses raw values. `resetFilters()` called at each run start to prevent stale state bleeding between cycles.
+- **Derivative low-pass filter**: Raw derivative `(error - prevError)/dt` is smoothed through a 0.3/0.7 single-pole filter before entering the PID equation. Prevents noise amplification from thermocouple jitter.
+- **Stage-based gain scheduling**: `AITuner::selectZone()` now accepts `ReflowStage` (PREHEAT/SOAK/REFLOW/COOLDOWN) instead of temperature thresholds. Gains correctly differentiate between e.g. preheat and soak at the same temperature.
+- **Per-profile adaptive fine-tuning**: After each zone completes, `ZoneMetrics` (overshoot, steady error, oscillation amplitude, settling time) are evaluated and gains adjusted conservatively (±5%). Gains are saved to NVS per-zone per-recipe on zone transition and profile completion. Precedence resolved via `calibSeq` / `tuneSeq` monotonic counters.
+- **Ziegler-Nichols base gains**: Calibration test now computes base Kp/Ki/Kd from deadtime and per-zone heating rates using the Ziegler-Nichols step-response method. These are written to all recipes when calibration is saved.
+- **Precedence system**: `calibSeq` (global, incremented per calibration test) vs `tuneSeq` (per-recipe, set on fine-tune) resolves gain origin. Whichever action occurred last overrides — calibration test resets all recipes; subsequent profile fine-tunes take precedence per-recipe.
+- **Integral management**: `resetIntegral()` called on every zone transition to prevent stale accumulation. Ki suppressed to zero when within 5°C of peak and rate-of-change < 0.5°C/s.
+- **Cooldown forcing**: Heater output forced to 0% during cooldown stage regardless of PID output.
+- **Recipe editor field 7**: Fine-tune enable/disable toggle (UP/DOWN to toggle, displayed as `Tune:ON/OFF` on the hold line).
+- **Post-build auto-versioning**: `rename_firmware.py` now runs automatically as a CMake POST_BUILD step after every `idf.py build` — no manual invocation needed.
+
+### Changed
+- `AITuner::learn()` removed (replaced by structured per-zone `fineTuneZone()` evaluation)
+- `AITuner::selectZone()` signature: `float setpoint` → `ReflowStage stage`
+- `BresenhamPID::compute()` now uses filtered derivative (`_dFiltered`) and adds `_feedforward` to output
+- `TemperatureReader::readSensors()` now applies EMA filter before returning temperature data
+- `ProfileEngine::getRampRate()` added for feedforward target rate computation
+- `ReflowRecipe` now includes `fineTuneEnabled` (bool) and `tuneSeq` (uint32_t)
+- `PidGains` now has Ziegler-Nichols-computed defaults from calibration instead of hardcoded defaults
+- Cooldown now uses named constant `COOLDOWN_DURATION_SEC` (60s) instead of inline literal
+- `AITuner` repurposed: removed `_spatialDamping`, `_learningRate`, `_lastError`; added `ZoneMetrics` helpers
+- `BresenhamPID` gains new methods: `setFeedforward()`, `resetIntegral()`, `getIntegral()`
+- `TemperatureReader` gains: `resetFilters()`, `_tc1Filtered`, `_tc2Filtered`, `_filterInitialized`
+
+### Removed
+- `AITuner::learn()` — continuous online heuristic replaced by post-zone structured evaluation
+- `_spatialDamping` modifier — gain scheduling is now deterministic per-stage lookups
+- Raw unfiltered derivative in PID compute — replaced by filtered derivative
+- Raw unfiltered temperature readings from `readSensors()` — EMA applied; faults still use raw
+
 ## [1.10.0] — 2026-06-01
 
 ### Added

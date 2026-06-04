@@ -14,6 +14,7 @@ public:
     void setCoolingGains(const PidGains& gains);
     void setSetpoint(float setpoint);
     float compute(float input, float dt);
+    void setFeedforward(float ff);
     void setRawHeaterPower(float power);
     void setRawCoolingPower(float power);
     float getOutput() const;
@@ -21,6 +22,9 @@ public:
     void emergencyStop();
     bool isEstopped() const;
     void reset();
+    void resetIntegral();
+    float getIntegral() const;
+
     static void handleZeroCrossing(void* arg);
 
     static void measureLineFrequency();
@@ -36,6 +40,8 @@ private:
     float _prevError;
     float _heaterOutput;
     float _coolingOutput;
+    float _feedforward;
+    float _dFiltered;
     bool _estopped;
 
     void bresenhamPower(float power);

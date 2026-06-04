@@ -11,9 +11,13 @@ public:
     TemperatureData readSensors();
     void setCalibrationOffset(int sensor, float offset);
     float getCalibrationOffset(int sensor) const;
+    void resetFilters();
 private:
     ADS1015_Driver _ads;
     float _tc1Offset;
     float _tc2Offset;
+    float _tc1Filtered;
+    float _tc2Filtered;
+    bool _filterInitialized;
     float rawToCelsius(int16_t raw);
 };

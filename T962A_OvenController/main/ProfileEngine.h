@@ -8,6 +8,7 @@ public:
     ProfileEngine();
     void loadRecipe(const ReflowRecipe& recipe);
     float getSetpoint(uint32_t elapsedSec) const;
+    float getRampRate(uint32_t elapsedSec) const;
     ReflowStage getStage(uint32_t elapsedSec) const;
     uint32_t getTotalDuration() const;
     const ReflowRecipe* getRecipe() const;

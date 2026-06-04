@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 #define FIRMWARE_VERSION_MAJOR 1
-#define FIRMWARE_VERSION_MINOR 10
+#define FIRMWARE_VERSION_MINOR 11
 #define FIRMWARE_VERSION_PATCH 0
 
 // T962A pin mappings (ESP32 WROOM)
@@ -81,3 +81,23 @@
 #define CALIB_COOLDOWN_TEMP      120.0f
 #define CALIB_DT_THRESHOLD       0.5f
 #define CALIB_COOL_TIMEOUT_SECS  300
+
+// Fine-tuning
+#define FINE_TUNE_OVERSHOOT_C      3.0f
+#define FINE_TUNE_STEADY_ERROR_C   2.0f
+#define FINE_TUNE_OSCILLATION_C    3.0f
+#define FINE_TUNE_ADJUST_RATE      0.05f
+#define FINE_TUNE_DAMP_RATE        0.10f
+#define FINE_TUNE_SETTLE_BAND_C    2.0f
+#define FINE_TUNE_RISE_PCT         0.9f
+#define FINE_TUNE_STEADY_FRAC      0.3f
+#define FINE_TUNE_KP_MIN           0.1f
+#define FINE_TUNE_KP_MAX           20.0f
+#define FINE_TUNE_KI_MIN           0.0f
+#define FINE_TUNE_KI_MAX           5.0f
+#define FINE_TUNE_KD_MIN           0.0f
+#define FINE_TUNE_KD_MAX           10.0f
+
+// Feedforward
+#define FF_CAP_PCT                 0.80f
+#define COOLDOWN_RAMP_RESERVE_C    5.0f

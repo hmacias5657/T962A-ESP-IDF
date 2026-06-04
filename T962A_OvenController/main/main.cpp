@@ -45,6 +45,7 @@ static SystemState g_systemState = STATE_MENU;
 static MenuScreen g_menuScreen = MENU_MAIN;
 static float g_tempHistory[480];
 static uint32_t g_tempHistoryCount = 0;
+static uint32_t g_calibSeq = 0;
 
 // Navigation state
 static int s_menuCursor = 0;
@@ -52,14 +53,14 @@ static int s_recipeCursor = 0;
 static int s_recipeField = 0;
 static int s_settingsField = 0;
 static int s_bakeField = 0;
-static int s_listAction = 0; // 0=run, 1=edit, 2=calibrate
+static int s_listAction = 0;
 static ReflowRecipe s_editRecipe = ReflowRecipe();
 static BakeSettings s_editBake = BakeSettings();
 static bool s_showPlot = false;
 
 // Calibration test state
 static int s_calibMenuCursor = 0;
-static int s_calibPhase = 0;          // 0=heating, 1=cooling
+static int s_calibPhase = 0;
 static int s_calibZone = 0;
 static float s_calibMaxHeatRates[PID_ZONES];
 static float s_calibMaxCoolRates[PID_ZONES];
@@ -81,11 +82,46 @@ static int s_calibNewReflow = 0;
 
 // Calibration info screen state
 static int s_calibInfoRecipeIdx = 0;
-static int s_calibInfoPage = 0;  // 0=PID gains, 1=Cal data, 2=Recipe temps
+static int s_calibInfoPage = 0;
 
 // Inter-task communication
 static QueueHandle_t g_telemetryQueue = NULL;
 static SemaphoreHandle_t g_i2cMutex = NULL;
+
+// Zone fine-tuning tracking
+static ZoneMetrics g_zoneMetrics;
+static ReflowStage g_prevStage = STAGE_IDLE;
+static int g_prevZone = -1;
+
+static void computeZieglerNichols(float deadTimeSec, float heatingRate,
+                                   PidGains& outGains) {
+    if (deadTimeSec < 0.1f) deadTimeSec = 0.1f;
+    if (heatingRate < 0.01f) heatingRate = 0.01f;
+    float tau = 1.0f / heatingRate;
+    outGains.kp = 1.2f * tau / deadTimeSec;
+    outGains.ki = outGains.kp / (2.0f * deadTimeSec);
+    outGains.kd = outGains.kp * 0.5f * deadTimeSec;
+    outGains.kp = fmaxf(FINE_TUNE_KP_MIN, fminf(FINE_TUNE_KP_MAX, outGains.kp));
+    outGains.ki = fmaxf(FINE_TUNE_KI_MIN, fminf(FINE_TUNE_KI_MAX, outGains.ki));
+    outGains.kd = fmaxf(FINE_TUNE_KD_MIN, fminf(FINE_TUNE_KD_MAX, outGains.kd));
+}
+
+static void applyCalibOverrideToRecipe(ReflowRecipe& recipe) {
+    float hDt = (s_calibHeatDeadTimeMs > 0) ? s_calibHeatDeadTimeMs / 1000.0f : 0.5f;
+    for (int z = 0; z < PID_ZONES; z++) {
+        float heatRate = (s_calibMaxHeatRates[z] > 0.01f) ? s_calibMaxHeatRates[z] : 0.5f;
+        computeZieglerNichols(hDt, heatRate, recipe.heaterGains[z]);
+        computeZieglerNichols(hDt, s_calibMaxCoolRates[z] > 0.01f ? fabsf(s_calibMaxCoolRates[z]) : 0.3f,
+                              recipe.coolingGains[z]);
+    }
+    recipe.tuneSeq = g_calibSeq;
+}
+
+static void ensureRecipeGainsFromCalib(ReflowRecipe& recipe) {
+    if (recipe.tuneSeq < g_calibSeq) {
+        applyCalibOverrideToRecipe(recipe);
+    }
+}
 
 // NVS helpers
 static void loadSettings() {
@@ -106,6 +142,10 @@ static void loadSettings() {
     nvs_get_i32(nvs, "maxBakeMin", &maxBake);
     g_settings.maxBakeMin = (uint16_t)maxBake;
 
+    int32_t calibSeq = 0;
+    nvs_get_i32(nvs, "calibSeq", &calibSeq);
+    g_calibSeq = (uint32_t)calibSeq;
+
     nvs_get_i32(nvs, "recipeCount", &g_recipeCount);
     if (g_recipeCount > MAX_RECIPES) g_recipeCount = MAX_RECIPES;
 
@@ -114,6 +154,19 @@ static void loadSettings() {
         snprintf(key, sizeof(key), "r%d_name", r);
         size_t len = MAX_RECIPE_NAME_LEN;
         nvs_get_str(nvs, key, g_recipes[r].name, &len);
+
+        g_recipes[r].fineTuneEnabled = true;
+        g_recipes[r].tuneSeq = 0;
+
+        snprintf(key, sizeof(key), "r%d_tuneEn", r);
+        uint8_t tuneEn = 1;
+        nvs_get_u8(nvs, key, &tuneEn);
+        g_recipes[r].fineTuneEnabled = (tuneEn != 0);
+
+        snprintf(key, sizeof(key), "r%d_tuneSeq", r);
+        int32_t tuneSeq = 0;
+        nvs_get_i32(nvs, key, &tuneSeq);
+        g_recipes[r].tuneSeq = (uint32_t)tuneSeq;
 
         int32_t val;
         snprintf(key, sizeof(key), "r%d_pre", r);
@@ -124,7 +177,6 @@ static void loadSettings() {
         if (nvs_get_i32(nvs, key, &val) == ESP_OK) g_recipes[r].peakTemp = val / 100.0f;
         snprintf(key, sizeof(key), "r%d_ramp", r);
         if (nvs_get_i32(nvs, key, &val) == ESP_OK) g_recipes[r].rampTimeSec = (uint16_t)val;
-        snprintf(key, sizeof(key), "r%d_soak", r); // reuse
         snprintf(key, sizeof(key), "r%d_refl", r);
         if (nvs_get_i32(nvs, key, &val) == ESP_OK) g_recipes[r].reflowTimeSec = (uint16_t)val;
         snprintf(key, sizeof(key), "r%d_hold", r);
@@ -144,6 +196,8 @@ static void loadSettings() {
             snprintf(key, sizeof(key), "r%d_z%d_ckd", r, z);
             if (nvs_get_i32(nvs, key, &val) == ESP_OK) g_recipes[r].coolingGains[z].kd = val / 1000.0f;
         }
+
+        ensureRecipeGainsFromCalib(g_recipes[r]);
     }
 
     nvs_close(nvs);
@@ -158,6 +212,7 @@ static void saveSettings() {
     nvs_set_i32(nvs, "tc2Off", (int32_t)(g_settings.tc2Offset * 100));
     nvs_set_i32(nvs, "maxBakeMin", g_settings.maxBakeMin);
     nvs_set_i32(nvs, "recipeCount", g_recipeCount);
+    nvs_set_i32(nvs, "calibSeq", (int32_t)g_calibSeq);
 
     for (int r = 0; r < g_recipeCount; r++) {
         char key[24];
@@ -175,6 +230,11 @@ static void saveSettings() {
         nvs_set_i32(nvs, key, g_recipes[r].reflowTimeSec);
         snprintf(key, sizeof(key), "r%d_hold", r);
         nvs_set_i32(nvs, key, g_recipes[r].holdTimeSec);
+
+        snprintf(key, sizeof(key), "r%d_tuneEn", r);
+        nvs_set_u8(nvs, key, g_recipes[r].fineTuneEnabled ? 1 : 0);
+        snprintf(key, sizeof(key), "r%d_tuneSeq", r);
+        nvs_set_i32(nvs, key, (int32_t)g_recipes[r].tuneSeq);
 
         for (int z = 0; z < PID_ZONES; z++) {
             snprintf(key, sizeof(key), "r%d_z%d_kp", r, z);
@@ -291,10 +351,11 @@ static void applyCalibToAllRecipes(const float* heatRates) {
         adjustRecipeRampReflow(g_recipes[i], heatRates, newRamp, newReflow);
         g_recipes[i].rampTimeSec = (uint16_t)newRamp;
         g_recipes[i].reflowTimeSec = (uint16_t)newReflow;
+        applyCalibOverrideToRecipe(g_recipes[i]);
         appliedCount++;
     }
     if (appliedCount > 0) {
-        ESP_LOGI(TAG, "Calibrated %d recipes", appliedCount);
+        ESP_LOGI(TAG, "Calibrated %d recipes (seq=%lu)", appliedCount, (unsigned long)g_calibSeq);
     }
 }
 
@@ -302,6 +363,8 @@ static void applyCalibToAllRecipes(const float* heatRates) {
 static void controlTask(void* pvParameters) {
     (void)pvParameters;
     TickType_t lastWake = xTaskGetTickCount();
+    g_prevStage = STAGE_IDLE;
+    g_prevZone = -1;
 
     while (1) {
         if (g_systemState == STATE_CALIB_TEST) {
@@ -328,14 +391,12 @@ static void controlTask(void* pvParameters) {
                     s_calibElapsedSec += (uint32_t)(g_pid.getPidIntervalMs() / 1000);
 
                     if (s_calibPhase == 0) {
-                        // HEATING PHASE: 100% heater, 0% fan
                         g_pid.setRawHeaterPower(1.0f);
 
                         float dT = temps.avg - s_calibPrevTemp;
                         s_calibCurrentRate = (dt > 0.0f) ? dT / dt : 0.0f;
                         s_calibPrevTemp = temps.avg;
 
-                        // Dead time measurement
                         if (!s_calibDeadTimeMeasured && s_calibCurrentRate > CALIB_DT_THRESHOLD) {
                             uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
                             s_calibHeatDeadTimeMs = now - s_calibPhaseStartMs;
@@ -363,7 +424,6 @@ static void controlTask(void* pvParameters) {
                         }
 
                         if (allVisited) {
-                            // Transition to cooling phase
                             s_calibPhase = 1;
                             s_calibPhaseStartMs = (uint32_t)(esp_timer_get_time() / 1000);
                             s_calibDeadTimeMeasured = false;
@@ -381,14 +441,12 @@ static void controlTask(void* pvParameters) {
                     }
 
                     if (s_calibPhase == 1) {
-                        // COOLING PHASE: 0% heater, 100% cooling fan
                         g_pid.setRawCoolingPower(1.0f);
 
                         float dT = temps.avg - s_calibPrevTemp;
                         s_calibCurrentRate = (dt > 0.0f) ? dT / dt : 0.0f;
                         s_calibPrevTemp = temps.avg;
 
-                        // Cooling dead time measurement (rate goes negative)
                         if (!s_calibDeadTimeMeasured && s_calibCurrentRate < -CALIB_DT_THRESHOLD) {
                             uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
                             s_calibCoolDeadTimeMs = now - s_calibPhaseStartMs;
@@ -401,7 +459,6 @@ static void controlTask(void* pvParameters) {
                         s_calibZoneVisited[zone] = true;
                         s_calibZone = zone;
 
-                        // Track most negative rate (fastest cooling) per zone
                         if (s_calibCurrentRate < s_calibMaxCoolRates[zone]) {
                             s_calibMaxCoolRates[zone] = s_calibCurrentRate;
                         }
@@ -411,7 +468,6 @@ static void controlTask(void* pvParameters) {
                         bool coolingDone = (coolingElapsed > coolingStart + CALIB_COOL_TIMEOUT_SECS);
 
                         if (temps.avg <= CALIB_COOLDOWN_TEMP || coolingDone) {
-                            // Calibration complete
                             g_pid.setRawCoolingPower(0.0f);
                             g_pid.reset();
 
@@ -444,7 +500,6 @@ static void controlTask(void* pvParameters) {
                     g_telemetry.setpoint = s_calibRecipe.peakTemp;
                     g_telemetry.actualTemp = temps.avg;
 
-                    // Record temperature history for live graph
                     if (g_tempHistoryCount < 480) {
                         g_tempHistory[g_tempHistoryCount++] = temps.avg;
                     }
@@ -472,37 +527,102 @@ static void controlTask(void* pvParameters) {
                     g_telemetry.setpoint = setpoint;
                     g_pid.setSetpoint(setpoint);
 
-                    int zone = g_tuner.selectZone(setpoint);
+                    ReflowStage curStage = g_profile.getStage(g_telemetry.elapsedSec);
+                    g_telemetry.stage = curStage;
+
+                    int zone = g_tuner.selectZone(curStage);
                     const ReflowRecipe* recipe = g_profile.getRecipe();
                     if (recipe) {
-                        PidGains hg = g_tuner.scheduleHeaterGains(recipe->heaterGains, zone);
-                        PidGains cg = g_tuner.scheduleCoolingGains(recipe->coolingGains, zone);
+                        PidGains hg = recipe->heaterGains[zone];
+                        PidGains cg = recipe->coolingGains[zone];
                         g_pid.setGains(hg);
                         g_pid.setCoolingGains(cg);
                     }
 
+                    // Zone transition handling
+                    if (curStage != g_prevStage || zone != g_prevZone) {
+                        if (g_prevZone >= 0 && recipe && recipe->fineTuneEnabled) {
+                            // Fine-tune the completed zone
+                            ReflowRecipe* r = const_cast<ReflowRecipe*>(g_profile.getRecipe());
+                            if (r && g_zoneMetrics.sampleCount > 2) {
+                                g_tuner.fineTuneZone(g_zoneMetrics, r->heaterGains[g_prevZone]);
+                                g_tuner.fineTuneZone(g_zoneMetrics, r->coolingGains[g_prevZone]);
+                                r->tuneSeq = g_calibSeq;
+                                ESP_LOGI(TAG, "Zone %d fine-tuned: kp=%.2f ki=%.3f kd=%.2f",
+                                         g_prevZone,
+                                         r->heaterGains[g_prevZone].kp,
+                                         r->heaterGains[g_prevZone].ki,
+                                         r->heaterGains[g_prevZone].kd);
+                                saveSettings();
+                            }
+                        }
+                        g_pid.resetIntegral();
+                        g_tuner.resetMetrics(g_zoneMetrics, setpoint, g_telemetry.elapsedSec);
+                        g_prevStage = curStage;
+                        g_prevZone = zone;
+                    }
+
+                    // Update zone metrics
                     float dt = g_pid.getPidIntervalMs() / 1000.0f;
-                    g_pid.compute(temps.avg, dt);
-                    g_tuner.learn(temps.avg, setpoint, g_pid.getOutput(), dt);
+                    g_tuner.updateMetrics(g_zoneMetrics, temps.avg, setpoint, dt);
+
+                    // Ki suppression near peak (layer 2 integral management)
+                    float error = setpoint - temps.avg;
+                    float dTemp = (temps.avg - g_telemetry.actualTemp) / dt;
+                    if (fabsf(error) < COOLDOWN_RAMP_RESERVE_C && fabsf(dTemp) < 0.5f && curStage == STAGE_REFLOW) {
+                        PidGains suppressed = recipe ? recipe->heaterGains[zone] : PidGains();
+                        if (recipe) {
+                            suppressed.ki = 0.0f;
+                            g_pid.setGains(suppressed);
+                        }
+                    }
+
+                    // Feedforward computation
+                    float rampRate = g_profile.getRampRate(g_telemetry.elapsedSec);
+                    float feedforward = 0.0f;
+                    if (rampRate > 0.0f && s_calibMaxHeatRates[zone] > 0.01f) {
+                        feedforward = (rampRate / s_calibMaxHeatRates[zone]) * FF_CAP_PCT;
+                        if (feedforward > FF_CAP_PCT) feedforward = FF_CAP_PCT;
+                    }
+                    g_pid.setFeedforward(feedforward);
+
+                    // Heater off during cooldown
+                    if (curStage == STAGE_COOLDOWN) {
+                        g_pid.setFeedforward(0.0f);
+                        g_pid.setRawHeaterPower(0.0f);
+                        g_telemetry.heaterPower = 0.0f;
+                        g_telemetry.coolingPower = g_pid.getCoolingOutput();
+                    } else {
+                        g_pid.compute(temps.avg, dt);
+                        g_telemetry.heaterPower = g_pid.getOutput();
+                        g_telemetry.coolingPower = g_pid.getCoolingOutput();
+                    }
 
                     g_telemetry.actualTemp = temps.avg;
-                    g_telemetry.heaterPower = g_pid.getOutput();
-                    g_telemetry.coolingPower = g_pid.getCoolingOutput();
-                    g_telemetry.stage = g_profile.getStage(g_telemetry.elapsedSec);
                     g_telemetry.elapsedSec += (g_pid.getPidIntervalMs() / 1000);
 
-                    if (g_telemetry.stage == STAGE_COMPLETE && g_systemState != STATE_ESTOP) {
+                    if (g_telemetry.stage == STAGE_COMPLETE) {
+                        // Save fine-tuned gains on profile completion
+                        if (recipe && recipe->fineTuneEnabled) {
+                            ReflowRecipe* r = const_cast<ReflowRecipe*>(g_profile.getRecipe());
+                            if (r) {
+                                r->tuneSeq = g_calibSeq;
+                                saveSettings();
+                                ESP_LOGI(TAG, "Profile complete, fine-tuned gains saved (seq=%lu)",
+                                         (unsigned long)g_calibSeq);
+                            }
+                        }
                         g_buzzer.play(BUZZER_CYCLE_COMPLETE);
                         g_pid.reset();
                         g_systemState = STATE_MENU;
+                        g_prevStage = STAGE_IDLE;
+                        g_prevZone = -1;
                     }
 
-                    // Update temperature history
                     if (g_tempHistoryCount < 480) {
                         g_tempHistory[g_tempHistoryCount++] = temps.avg;
                     }
 
-                    // Send telemetry to UI task
                     if (g_telemetryQueue) {
                         xQueueOverwrite(g_telemetryQueue, &g_telemetry);
                     }
@@ -519,6 +639,10 @@ static void uiTask(void* pvParameters) {
     (void)pvParameters;
     TickType_t lastWake = xTaskGetTickCount();
     ThermalTelemetry localTelemetry = {};
+
+    // Fields per menu:
+    // Recipe edit: 0=preheat, 1=soak, 2=peak, 3=ramp, 4=soakTime, 5=reflow, 6=hold, 7=fineTune
+    static const int RECIPE_FIELD_COUNT = 8;
 
     while (1) {
         g_buttons.update();
@@ -555,14 +679,14 @@ static void uiTask(void* pvParameters) {
                 if (g_buttons.isPressed(PIN_BTN_S_SELECT)) {
                     g_buttons.clearPress(PIN_BTN_S_SELECT);
                     switch (s_menuCursor) {
-                    case 0: // Run Reflow
+                    case 0:
                         if (g_recipeCount > 0) {
                             g_menuScreen = MENU_RECIPE_LIST;
                             s_recipeCursor = 0;
                             s_listAction = 0;
                         }
                         break;
-                    case 1: { // Create Recipe
+                    case 1: {
                         ReflowRecipe r = ReflowRecipe();
                         snprintf(r.name, MAX_RECIPE_NAME_LEN, "New%d", (int)(g_recipeCount + 1));
                         r.preheatTemp = 150.0f;
@@ -572,6 +696,8 @@ static void uiTask(void* pvParameters) {
                         r.soakTimeSec = 60;
                         r.reflowTimeSec = 45;
                         r.holdTimeSec = 10;
+                        r.fineTuneEnabled = true;
+                        r.tuneSeq = g_calibSeq;
                         for (int z = 0; z < PID_ZONES; z++) {
                             r.heaterGains[z].kp = 2.0f;
                             r.heaterGains[z].ki = 0.1f;
@@ -580,30 +706,31 @@ static void uiTask(void* pvParameters) {
                             r.coolingGains[z].ki = 0.05f;
                             r.coolingGains[z].kd = 0.2f;
                         }
+                        ensureRecipeGainsFromCalib(r);
                         s_editRecipe = r;
                         s_recipeField = 0;
                         g_menuScreen = MENU_RECIPE_EDIT;
                         break;
                     }
-                    case 2: // Edit Recipe
+                    case 2:
                         if (g_recipeCount > 0) {
                             g_menuScreen = MENU_RECIPE_LIST;
                             s_recipeCursor = 0;
                             s_listAction = 1;
                         }
                         break;
-                    case 3: // Bake Mode
+                    case 3:
                         s_editBake = BakeSettings();
                         s_editBake.temperature = 100;
                         s_editBake.durationMin = 30;
                         s_bakeField = 0;
                         g_menuScreen = MENU_BAKE_SETUP;
                         break;
-                    case 4: // Settings
+                    case 4:
                         s_settingsField = 0;
                         g_menuScreen = MENU_SETTINGS;
                         break;
-                    case 5: // Calibration
+                    case 5:
                         s_calibMenuCursor = 0;
                         g_menuScreen = MENU_CALIB_SUBMENU;
                         break;
@@ -631,7 +758,11 @@ static void uiTask(void* pvParameters) {
                         if (s_listAction == 0) {
                             g_profile.loadRecipe(g_recipes[s_recipeCursor]);
                             g_pid.reset();
+                            g_tempReader.resetFilters();
                             g_tempHistoryCount = 0;
+                            g_prevStage = STAGE_IDLE;
+                            g_prevZone = -1;
+                            g_tuner.resetMetrics(g_zoneMetrics, 0, 0);
                             g_systemState = STATE_RUNNING;
                         } else {
                             s_editRecipe = g_recipes[s_recipeCursor];
@@ -652,6 +783,7 @@ static void uiTask(void* pvParameters) {
                     case 4: if (s_editRecipe.soakTimeSec < 300)   s_editRecipe.soakTimeSec += 5; break;
                     case 5: if (s_editRecipe.reflowTimeSec < 300) s_editRecipe.reflowTimeSec += 5; break;
                     case 6: if (s_editRecipe.holdTimeSec < 120)   s_editRecipe.holdTimeSec += 5; break;
+                    case 7: s_editRecipe.fineTuneEnabled = !s_editRecipe.fineTuneEnabled; break;
                     }
                     g_buttons.clearPress(PIN_BTN_F1_UP);
                 }
@@ -664,6 +796,7 @@ static void uiTask(void* pvParameters) {
                     case 4: if (s_editRecipe.soakTimeSec >= 5)    s_editRecipe.soakTimeSec -= 5; break;
                     case 5: if (s_editRecipe.reflowTimeSec >= 5)  s_editRecipe.reflowTimeSec -= 5; break;
                     case 6: if (s_editRecipe.holdTimeSec >= 5)    s_editRecipe.holdTimeSec -= 5; break;
+                    case 7: s_editRecipe.fineTuneEnabled = !s_editRecipe.fineTuneEnabled; break;
                     }
                     g_buttons.clearPress(PIN_BTN_F2_DOWN);
                 }
@@ -672,7 +805,7 @@ static void uiTask(void* pvParameters) {
                     g_buttons.clearPress(PIN_BTN_F3_LEFT);
                 }
                 if (g_buttons.isPressed(PIN_BTN_F4_RIGHT)) {
-                    s_recipeField = (s_recipeField < 6) ? s_recipeField + 1 : 0;
+                    s_recipeField = (s_recipeField < RECIPE_FIELD_COUNT - 1) ? s_recipeField + 1 : 0;
                     g_buttons.clearPress(PIN_BTN_F4_RIGHT);
                 }
                 if (g_buttons.isPressed(PIN_BTN_S_SELECT)) {
@@ -731,6 +864,8 @@ static void uiTask(void* pvParameters) {
                     bakeRecipe.soakTimeSec = 0;
                     bakeRecipe.reflowTimeSec = s_editBake.durationMin * 60;
                     bakeRecipe.holdTimeSec = 0;
+                    bakeRecipe.fineTuneEnabled = true;
+                    bakeRecipe.tuneSeq = g_calibSeq;
                     for (int z = 0; z < PID_ZONES; z++) {
                         bakeRecipe.heaterGains[z].kp = 2.0f;
                         bakeRecipe.heaterGains[z].ki = 0.1f;
@@ -739,9 +874,14 @@ static void uiTask(void* pvParameters) {
                         bakeRecipe.coolingGains[z].ki = 0.05f;
                         bakeRecipe.coolingGains[z].kd = 0.2f;
                     }
+                    ensureRecipeGainsFromCalib(bakeRecipe);
                     g_profile.loadRecipe(bakeRecipe);
                     g_pid.reset();
+                    g_tempReader.resetFilters();
                     g_tempHistoryCount = 0;
+                    g_prevStage = STAGE_IDLE;
+                    g_prevZone = -1;
+                    g_tuner.resetMetrics(g_zoneMetrics, 0, 0);
                     g_systemState = STATE_BAKING;
                 }
                 g_display.renderBakeSetup(s_editBake, s_bakeField);
@@ -854,7 +994,10 @@ static void uiTask(void* pvParameters) {
                         s_calibOldReflow = s_calibRecipe.reflowTimeSec;
                         s_calibNewReflow = s_calibRecipe.reflowTimeSec;
                         g_pid.reset();
+                        g_tempReader.resetFilters();
                         g_tempHistoryCount = 0;
+                        g_prevStage = STAGE_IDLE;
+                        g_prevZone = -1;
                         g_systemState = STATE_CALIB_TEST;
                     }
                 }
@@ -870,6 +1013,7 @@ static void uiTask(void* pvParameters) {
                     g_recipeCount);
                 if (g_buttons.isPressed(PIN_BTN_S_SELECT)) {
                     g_buttons.clearPress(PIN_BTN_S_SELECT);
+                    g_calibSeq++;
                     applyCalibToAllRecipes(s_calibMaxHeatRates);
                     saveSettings();
                     saveCalibData(s_calibMaxHeatRates, s_calibMaxCoolRates,
@@ -877,7 +1021,8 @@ static void uiTask(void* pvParameters) {
                     float hDt = s_calibHeatDeadTimeMs / 1000.0f;
                     float cDt = s_calibCoolDeadTimeMs / 1000.0f;
                     g_tuner.setDeadTime(hDt, cDt);
-                    ESP_LOGI(TAG, "Calib saved & applied to all recipes, dead time H:%lums C:%lums",
+                    ESP_LOGI(TAG, "Calib seq %lu saved & applied to all recipes, dead time H:%lums C:%lums",
+                             (unsigned long)g_calibSeq,
                              (unsigned long)s_calibHeatDeadTimeMs, (unsigned long)s_calibCoolDeadTimeMs);
                     g_menuScreen = MENU_CALIB_SUBMENU;
                 }
@@ -982,7 +1127,6 @@ extern "C" void app_main() {
     ESP_LOGI(TAG, "OvenController v%d.%d.%d starting...",
              FIRMWARE_VERSION_MAJOR, FIRMWARE_VERSION_MINOR, FIRMWARE_VERSION_PATCH);
 
-    // 1. Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -990,7 +1134,6 @@ extern "C" void app_main() {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 2. Initialize I2C bus (ADS1015)
     i2c_master_bus_handle_t bus_handle;
     i2c_master_bus_config_t i2c_cfg = {};
     i2c_cfg.i2c_port = I2C_NUM_0;
@@ -1001,15 +1144,12 @@ extern "C" void app_main() {
     i2c_cfg.flags.enable_internal_pullup = true;
     i2c_new_master_bus(&i2c_cfg, &bus_handle);
 
-    // 3. Initialize temperature reader
     g_tempReader.init(bus_handle);
 
-    // 4. Initialize GPIO (SSR, ZC, buttons, buzzer)
     g_pid.init();
     g_buttons.init();
     g_buzzer.init();
 
-    // 5. Initialize LEDC (system fan)
     ledc_timer_config_t timer_cfg = {};
     timer_cfg.speed_mode = LEDC_LOW_SPEED_MODE;
     timer_cfg.duty_resolution = LEDC_TIMER_8_BIT;
@@ -1026,7 +1166,6 @@ extern "C" void app_main() {
     chan_cfg.hpoint = 0;
     ledc_channel_config(&chan_cfg);
 
-    // 6. Load NVS data
     loadSettings();
     g_tempReader.setCalibrationOffset(0, g_settings.tc1Offset);
     g_tempReader.setCalibrationOffset(1, g_settings.tc2Offset);
@@ -1036,10 +1175,10 @@ extern "C" void app_main() {
         s_calibHeatDeadTimeMs = hDt;
         s_calibCoolDeadTimeMs = cDt;
         g_tuner.setDeadTime(hDt / 1000.0f, cDt / 1000.0f);
-        ESP_LOGI(TAG, "Calib data loaded, dead time H:%lums C:%lums", (unsigned long)hDt, (unsigned long)cDt);
+        ESP_LOGI(TAG, "Calib data loaded, dead time H:%lums C:%lums, calibSeq=%lu",
+                 (unsigned long)hDt, (unsigned long)cDt, (unsigned long)g_calibSeq);
     }
 
-    // 6b. Measure line frequency from ZC interrupts
     g_pid.measureLineFrequency();
     {
         nvs_handle_t nvs;
@@ -1057,15 +1196,12 @@ extern "C" void app_main() {
         }
     }
 
-    // 7. Create queues / semaphores
     g_telemetryQueue = xQueueCreate(1, sizeof(ThermalTelemetry));
     g_i2cMutex = xSemaphoreCreateMutex();
 
-    // 8. Create FreeRTOS tasks
     xTaskCreatePinnedToCore(controlTask, "control", 4096, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(uiTask, "ui", 8192, NULL, 1, NULL, 1);
 
-    // 9. Initialize display and show splash
     g_display.init();
     {
         char verBuf[24];
@@ -1076,8 +1212,7 @@ extern "C" void app_main() {
         ESP_LOGI(TAG, "Splash: v%s, %.1f Hz", verBuf, lf);
     }
 
-    ESP_LOGI(TAG, "Startup complete");
+    ESP_LOGI(TAG, "Startup complete, calibSeq=%lu", (unsigned long)g_calibSeq);
 
-    // Delete startup task
     vTaskDelete(NULL);
 }

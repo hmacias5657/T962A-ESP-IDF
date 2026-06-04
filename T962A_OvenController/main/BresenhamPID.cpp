@@ -10,6 +10,8 @@
 
 static const char* TAG = "BresenhamPID";
 
+static const float D_FILTER_ALPHA = 0.3f;
+
 volatile int BresenhamPID::_zcCount = 0;
 volatile int BresenhamPID::_heaterOnCycles = 0;
 volatile int BresenhamPID::_coolingOnCycles = 0;
@@ -24,6 +26,7 @@ BresenhamPID::BresenhamPID()
     , _ckp(0.0f), _cki(0.0f), _ckd(0.0f)
     , _setpoint(0.0f), _integral(0.0f), _prevError(0.0f)
     , _heaterOutput(0.0f), _coolingOutput(0.0f)
+    , _feedforward(0.0f), _dFiltered(0.0f)
     , _estopped(false) {}
 
 void BresenhamPID::init() {
@@ -70,25 +73,38 @@ float BresenhamPID::compute(float input, float dt) {
     if (_estopped) return 0.0f;
 
     float error = _setpoint - input;
+
     _integral += error * dt;
     _integral = fmaxf(-100.0f, fminf(100.0f, _integral));
-    float derivative = (error - _prevError) / dt;
+
+    float rawD = (error - _prevError) / dt;
+    _dFiltered = D_FILTER_ALPHA * rawD + (1.0f - D_FILTER_ALPHA) * _dFiltered;
     _prevError = error;
 
-    _heaterOutput = _kp * error + _ki * _integral + _kd * derivative;
+    _heaterOutput = _kp * error + _ki * _integral + _kd * _dFiltered;
     _heaterOutput = fmaxf(0.0f, fminf(1.0f, _heaterOutput));
 
-    _coolingOutput = _ckp * error + _cki * _integral + _ckd * derivative;
+    _coolingOutput = _ckp * error + _cki * _integral + _ckd * _dFiltered;
     _coolingOutput = fmaxf(0.0f, fminf(1.0f, _coolingOutput));
 
     if (error < 0) {
         _heaterOutput = 0.0f;
     }
 
-    bresenhamPower(_heaterOutput);
+    float totalHeater = _heaterOutput + _feedforward;
+    if (totalHeater > 1.0f) totalHeater = 1.0f;
+    if (totalHeater < 0.0f) totalHeater = 0.0f;
+
+    bresenhamPower(totalHeater);
     bresenhamCooling(_coolingOutput);
 
-    return _heaterOutput;
+    return totalHeater;
+}
+
+void BresenhamPID::setFeedforward(float ff) {
+    _feedforward = ff;
+    if (_feedforward < 0.0f) _feedforward = 0.0f;
+    if (_feedforward > FF_CAP_PCT) _feedforward = FF_CAP_PCT;
 }
 
 void BresenhamPID::setRawHeaterPower(float power) {
@@ -128,9 +144,19 @@ bool BresenhamPID::isEstopped() const { return _estopped; }
 void BresenhamPID::reset() {
     _integral = 0.0f;
     _prevError = 0.0f;
+    _dFiltered = 0.0f;
     _heaterOutput = 0.0f;
     _coolingOutput = 0.0f;
+    _feedforward = 0.0f;
     _estopped = false;
+}
+
+void BresenhamPID::resetIntegral() {
+    _integral = 0.0f;
+}
+
+float BresenhamPID::getIntegral() const {
+    return _integral;
 }
 
 void IRAM_ATTR BresenhamPID::handleZeroCrossing(void* arg) {
@@ -167,7 +193,8 @@ void IRAM_ATTR BresenhamPID::handleZeroCrossing(void* arg) {
 }
 
 void BresenhamPID::bresenhamPower(float power) {
-    _heaterOnCycles = (int)(power * BRESENHAM_CYCLES);
+    float bounded = fmaxf(0.0f, fminf(1.0f, power));
+    _heaterOnCycles = (int)(bounded * BRESENHAM_CYCLES);
     if (_heaterOnCycles > BRESENHAM_CYCLES) _heaterOnCycles = BRESENHAM_CYCLES;
     if (_heaterOnCycles < 0) _heaterOnCycles = 0;
 }
