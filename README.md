@@ -118,7 +118,7 @@ The `rename_firmware.py` script runs automatically via CMake POST_BUILD after ea
 
 ## Porting Notes
 
-This is a from-scratch port of an Arduino reflow controller to ESP-IDF. All Arduino dependencies replaced:
+This is a from-scratch port of my PlatformIO ESP32 reflow controller to ESP-IDF. All Arduino dependencies replaced:
 - `Adafruit_ADS1X15` → custom `ADS1015_Driver` via `i2c_master`
 - `U8G2` Arduino constructor → ESP-IDF pin setup via `u8x8_SetPin` (KS0108 parallel byte function)
 - `Preferences` → `nvs_flash` direct API
