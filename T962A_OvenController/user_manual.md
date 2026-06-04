@@ -1,4 +1,4 @@
-# User Manual — OvenController v1.10.0
+# User Manual — OvenController v1.11.0
 
 ## Overview
 
@@ -46,12 +46,15 @@ Select **Create Recipe** to create a new recipe with default values, then edit f
 | Soak Time | 0–300 sec | 60 sec | Dwell time at soak temperature |
 | Reflow Time | 0–300 sec | 45 sec | Time above liquidus (peak) |
 | Hold Time | 0–120 sec | 10 sec | Additional hold at peak |
+| Fine-Tune | ON/OFF | ON | Per-profile adaptive gain fine-tuning |
 
 **Editing controls:**
 - **F3 (LEFT) / F4 (RIGHT)**: Switch between fields
-- **F1 (UP) / F2 (DOWN)**: Increase / decrease value (temperatures in 5°C steps, times in 5s steps)
+- **F1 (UP) / F2 (DOWN)**: Increase / decrease value (temperatures in 5°C steps, times in 5s steps; **toggles Fine-Tune ON/OFF**)
 - **S (SELECT)**: Save recipe and return to main menu
 - **F3 (LEFT)** on any field: Cancel and return to main menu
+
+**About Fine-Tuning**: When enabled (ON), the system evaluates PID performance after each zone completes (overshoot, steady error, oscillation) and adjusts gains conservatively (±5%) per zone, per run. Gains converge over 3–5 runs. Disable (OFF) once the profile tracks well to lock gains. If a Calibration Test runs, it overrides all per-profile gains with fresh Ziegler-Nichols-computed values.
 
 ## Running a Reflow Cycle
 
@@ -146,7 +149,7 @@ The calibration test screen shows a real-time temperature-vs-time graph alongsid
 Reflow Oven
  Controller
 ──────────────
-Ver 1.9.0
+Ver 1.11.0
 50 Hz
 ```
 Shown for ~2s on boot. Displays firmware version and auto-detected line frequency. If measurement fails, shows "Measuring..." until timeout.
@@ -224,9 +227,10 @@ Shows recipe temperature setpoints (in user-selected °C or °F) and timing para
 ## Maintenance
 
 ### Calibration
+Thermocouple offsets (TC1 and TC2) are stored in NVS and applied automatically at startup. To calibrate:
 1. Place a calibrated temperature probe next to the oven TC
-2. Navigate to **Settings → TC1 Offset / TC2 Offset**
-3. Adjust in 0.5°C increments until display matches reference
+2. Navigate to **Calibration → TC Offset Info** for instructions
+3. Offsets are adjusted by modifying `g_settings.tc1Offset` / `g_settings.tc2Offset` in the source or via the calibration info screen
 
 ### Sensor Check
 If the display shows "SENSOR FAULT":
@@ -257,10 +261,13 @@ If the display shows "SENSOR FAULT":
 - **Fan PWM**: 25kHz, 8-bit resolution
 - **Line frequency**: Auto-detected 50Hz or 60Hz via ZC interrupt timing
 - **Recipe storage**: 10 recipes in NVS
-- **PID zones**: 5 temperature ranges per recipe
+- **PID zones**: 5 stages per recipe (PREHEAT/SOAK/REFLOW/COOLDOWN/IDLE)
+- **Feedforward**: Ramp-rate based, capped at 80% of max output
+- **Fine-tuning**: Per-profile, per-zone ±5% conservative adjustment, sequence-numbered precedence
+- **Temperature filtering**: EMA (alpha=0.15) on both thermocouples + filtered derivative in PID
 
 ## Firmware Version
 
-Current version: **v1.10.0** (ESP-IDF port)
+Current version: **v1.11.0**
 
-Version is defined in `main/Config.h` and appended to the firmware binary automatically by the `rename_firmware.py` post-build script. Version and line frequency are shown on the GLCD splash screen, and also logged via serial monitor (`ESP_LOGI` output).
+Version is defined in `main/Config.h` and appended to the firmware binary automatically by the `rename_firmware.py` CMake POST_BUILD step (runs after every `idf.py build`). Version and line frequency are shown on the GLCD splash screen, and also logged via serial monitor (`ESP_LOGI` output).

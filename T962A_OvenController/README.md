@@ -1,6 +1,9 @@
-# OvenController — Adaptive PID Reflow Oven (ESP-IDF)
+# T962A-ESP-IDF — Adaptive PID Reflow Oven (ESP-IDF)
 
 ESP32-based reflow oven controller for T962A conversions. Ported from Arduino PlatformIO to ESP-IDF v5.x native SDK.
+
+> **Repo**: [github.com/hmacias5657/T962A-ESP-IDF](https://github.com/hmacias5657/T962A-ESP-IDF)  
+> **Project root**: `T962A_OvenController/` (run `idf.py` commands from this directory)
 
 ## Hardware
 
@@ -16,26 +19,31 @@ ESP32-based reflow oven controller for T962A conversions. Ported from Arduino Pl
 
 - Dual-core FreeRTOS: Core 0 (control ~2.13–2.56s), Core 1 (UI ~30ms)
 - Auto-detected line frequency at startup (50Hz or 60Hz) — eliminates hardcoded regional assumption
-- Bresenham PID power distribution — heater + cooling fan SSR
-- 5 independent PID gain sets per recipe (both heater and cooling)
+- Bresenham PID power distribution with feedforward control — PID + feedforward from profile ramp rate, capped at 80%
+- 5 independent PID gain sets per recipe (both heater and cooling), with stage-based scheduling (PREHEAT/SOAK/REFLOW/COOLDOWN)
+- Per-profile adaptive fine-tuning — gains adjusted ±5% after each zone based on overshoot, steady error, oscillation, settling time. Sequence-numbered precedence resolves calibration test vs per-profile tuning
+- Ziegler-Nichols base gains computed from deadtime + per-zone heating rates during calibration test
+- EMA temperature filtering (alpha=0.15) on both thermocouples with filtered derivative in PID
 - ADS1015 12-bit external ADC with ±10°C per-sensor calibration (0.5°C steps)
 - 8-minute live temperature plot (280°C Y-axis, 128x64 GLCD)
-- Profile creation wizard (7 parameters: preheat/soak/peak temps, ramp/soak/reflow/hold times)
+- Profile creation wizard (8 parameters: temps, timings, fine-tune enable toggle)
 - Bake/drying mode (25–280°C, 1–999 min)
 - °C/°F unit toggle (all temperatures auto-convert across running display, plot, recipe editor, bake setup, calibration info)
 - Calibration info screen (3-page viewer: PID gains, calibration rates/dead times, recipe temperature setpoints)
 - Calibration test with real-time temperature-vs-time graph (phase, zone, power, current/max rate)
-- AITuner gain scheduler (spatial damping + learning heuristic)
-- NVS persistence: 10 recipes, per-zone gains, settings, calibration
+- Integral management: reset on zone transition, Ki suppression near peak
+- Cooldown: heater forced off during cooldown stage
+- NVS persistence: 10 recipes, per-zone gains, settings, calibration, sequence tracking
+- Post-build auto-versioning: `rename_firmware.py` runs automatically via CMake POST_BUILD
 - Safety: over-temp (280°C), sensor fault (<5°C), spatial delta (>45°C), HW E-STOP
 - Buzzer patterns for transitions, completion, errors, E-STOP
 
 ## Project Structure
 
 ```
-OvenController/
-├── CMakeLists.txt              # Top-level CMake
-├── sdkconfig                   # idf.py menuconfig output
+T962A_OvenController/
+├── CMakeLists.txt              # Top-level CMake (project OvenController)
+├── sdkconfig                   # idf.py menuconfig output (gitignored)
 ├── partitions.csv              # Custom partition table (NVS + OTA)
 ├── rename_firmware.py          # Post-build firmware versioning script
 ├── CHANGELOG.md                # Release history
@@ -47,11 +55,11 @@ OvenController/
 │   ├── Config.h                # Pin mappings, constants, limits, firmware version
 │   ├── SharedData.h            # Structs, enums, recipes
 │   ├── main.cpp                # app_main(), task creation
-│   ├── BresenhamPID.h/.cpp     # ZC ISR, dual Bresenham, PID compute
-│   ├── TemperatureReader.h/.cpp# ADS1015 I2C reads, calibration
-│   ├── ProfileEngine.h/.cpp    # 5-stage linear interpolation
-│   ├── AITuner.h/.cpp          # Gain scheduler + learning heuristic
-│   ├── DisplayRenderer.h/.cpp  # KS0108 U8G2 menu machine + plot
+│   ├── BresenhamPID.h/.cpp     # ZC ISR, dual Bresenham, PID with feedforward + filtered derivative
+│   ├── TemperatureReader.h/.cpp# ADS1015 I2C reads, EMA filter, calibration offsets
+│   ├── ProfileEngine.h/.cpp    # 5-stage linear interpolation + ramp rate for feedforward
+│   ├── AITuner.h/.cpp          # Stage-based gain scheduling, ZoneMetrics, per-zone fine-tuning
+│   ├── DisplayRenderer.h/.cpp  # KS0108 U8G2 menu machine + plot (8-field recipe editor)
 │   ├── ButtonDebouncer.h/.cpp  # 50ms debounce, 6 keys
 │   ├── Buzzer.h/.cpp           # 6 buzzer patterns
 │   └── ADS1015_Driver.h/.cpp   # Direct I2C ADS1015 (no Adafruit)
@@ -66,7 +74,9 @@ OvenController/
 - ESP32 target
 
 ### Build & Flash
+All commands run from the `T962A_OvenController/` directory:
 ```bash
+cd T962A_OvenController
 idf.py set-target esp32
 idf.py menuconfig
 # Settings: CPU freq 240MHz, dual-core, custom partition table
@@ -74,13 +84,10 @@ idf.py build
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
-### Firmware Versioning (Post-Build)
-```bash
-python3 rename_firmware.py
-```
-Appends version number (from `Config.h`) and build timestamp to the output `.bin`:
-- `OvenController_v1.9.0_20260531_185000.bin` — unique timestamped archive
-- `OvenController_v1.9.0.bin` — latest version shortcut
+### Firmware Versioning (Auto Post-Build)
+The `rename_firmware.py` script runs **automatically** as a CMake POST_BUILD step after every `idf.py build`. It reads the version from `Config.h` and creates:
+- `OvenController_v1.11.0_20260603_120000.bin` — unique timestamped archive
+- `OvenController_v1.11.0.bin` — latest version shortcut
 
 ### First Run
 1. Flash firmware to ESP32
@@ -104,10 +111,10 @@ Edit `main/Config.h` for pin mappings and constants. Key NVS settings autoload:
 Firmware version is defined in `main/Config.h`:
 ```c
 #define FIRMWARE_VERSION_MAJOR 1
-#define FIRMWARE_VERSION_MINOR 9
+#define FIRMWARE_VERSION_MINOR 11
 #define FIRMWARE_VERSION_PATCH 0
 ```
-Run `python3 rename_firmware.py` after each build to generate versioned `.bin` files.
+The `rename_firmware.py` script runs automatically via CMake POST_BUILD after each `idf.py build`.
 
 ## Porting Notes
 
@@ -119,4 +126,4 @@ This is a from-scratch port of an Arduino reflow controller to ESP-IDF. All Ardu
 
 ## License
 
-Internal project — no license specified.
+Source available at [github.com/hmacias5657/T962A-ESP-IDF](https://github.com/hmacias5657/T962A-ESP-IDF). No license specified.
